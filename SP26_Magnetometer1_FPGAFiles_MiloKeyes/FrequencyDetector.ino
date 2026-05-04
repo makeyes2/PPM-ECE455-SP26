@@ -3,10 +3,8 @@
 // Drives cnt_enable / start_transmit, reads done / sclk / freqOut,
 // and computes frequency in Hz from the 32-bit cycle count.
 
-#include <TinyGPSPlus.h>
 #include <SD.h>
-
-#define GNSS_SERIAL Serial1
+#include <TinyGPSPlus.h>
 
 // ────────────────────────────────────────────────────────────────────
 //  Pin assignments  (change to match your wiring)
@@ -18,107 +16,198 @@ const int PIN_DONE           = 5;   // Arduino IN  ← FPGA done
 const int PIN_SCLK           = 6;   // Arduino IN  ← FPGA sclk
 const int PIN_FREQ_OUT       = 7;   // Arduino IN  ← FPGA freqOut
 
+// GT-U7 GPS on Teensy 4.1 Serial1:
+//   GPS TX -> Teensy pin 0 (RX1)
+//   GPS RX -> Teensy pin 1 (TX1, optional)
+const int PIN_GPS_RX1 = 0;
+const int PIN_GPS_TX1 = 1;
+
 // ────────────────────────────────────────────────────────────────────
 //  FPGA / measurement constants
 // ────────────────────────────────────────────────────────────────────
-const double   FPGA_CLK_HZ       = 12000000.0;  // 12 MHz FPGA clock
+const double   FPGA_CLK_HZ       = 12000400.0;  // 12 MHz FPGA clock
 const uint16_t NUM_PERIODS       = 2048;         // rising edges counted
 const uint32_t MEASURE_TIMEOUT_MS = 30000;       // 30 s max wait for done
 const uint32_t TX_TIMEOUT_MS      = 5000;        // 5 s max for serial readout
 const int      TX_BITS            = 32;
-const uint32_t GNSS_BAUD_RATE     = 9600;
-const char     LOG_FILENAME[]     = "/freq_log.csv";
+
+const uint32_t GPS_BAUD_RATE      = 9600;
+
+#ifdef BUILTIN_SDCARD
+const int SD_CS_PIN = BUILTIN_SDCARD;
+#else
+const int SD_CS_PIN = 10;
+#endif
 
 TinyGPSPlus gps;
 bool sdReady = false;
+char currentLogFileName[13] = "FREQ0000.CSV";
 
-void pollGNSS() {
-    while (GNSS_SERIAL.available() > 0) {
-        gps.encode(GNSS_SERIAL.read());
+void updateGPS() {
+    while (Serial1.available() > 0) {
+        gps.encode(Serial1.read());
     }
 }
 
-void writeCsvHeaderIfNeeded() {
-    if (SD.exists(LOG_FILENAME)) {
-        return;
+void printOrNA(Print &out, bool valid, double value, int decimals) {
+    if (valid) {
+        out.print(value, decimals);
+    } else {
+        out.print("NA");
     }
-
-    File file = SD.open(LOG_FILENAME, FILE_WRITE);
-    if (!file) {
-        Serial.println("ERROR: unable to create CSV log file");
-        return;
-    }
-
-    file.println("millis,gnss_utc,status,frequency_hz,latitude,longitude,altitude_m,satellites");
-    file.close();
 }
 
-void writeCsvRow(double freq) {
+void printTwoDigits(Print &out, uint8_t v) {
+    if (v < 10) {
+        out.print('0');
+    }
+    out.print(v);
+}
+
+void printFourDigits(Print &out, uint16_t v) {
+    if (v < 1000) {
+        out.print('0');
+    }
+    if (v < 100) {
+        out.print('0');
+    }
+    if (v < 10) {
+        out.print('0');
+    }
+    out.print(v);
+}
+
+bool createSessionLogFile() {
+    if (!sdReady) {
+        return false;
+    }
+
+    for (uint16_t i = 1; i <= 9999; i++) {
+        snprintf(currentLogFileName, sizeof(currentLogFileName), "FREQ%04u.CSV", (unsigned)i);
+        if (SD.exists(currentLogFileName)) {
+            continue;
+        }
+
+        File f = SD.open(currentLogFileName, FILE_WRITE);
+        if (!f) {
+            Serial.println("ERROR: failed to create session log file");
+            return false;
+        }
+
+        f.println("boot_ms,frequency_hz,gps_date_utc,gps_time_utc,latitude,longitude,altitude_m,satellites,hdop");
+        f.close();
+
+        Serial.print("Logging to ");
+        Serial.println(currentLogFileName);
+        return true;
+    }
+
+    Serial.println("ERROR: no free session log filename available");
+    return false;
+}
+
+void printGpsDebugLine() {
+    Serial.print("GPS UTC ");
+    if (gps.date.isValid() && gps.time.isValid()) {
+        printFourDigits(Serial, gps.date.year());
+        Serial.print('-');
+        printTwoDigits(Serial, gps.date.month());
+        Serial.print('-');
+        printTwoDigits(Serial, gps.date.day());
+        Serial.print(' ');
+        printTwoDigits(Serial, gps.time.hour());
+        Serial.print(':');
+        printTwoDigits(Serial, gps.time.minute());
+        Serial.print(':');
+        printTwoDigits(Serial, gps.time.second());
+        Serial.print('.');
+        printTwoDigits(Serial, gps.time.centisecond());
+    } else {
+        Serial.print("NA");
+    }
+
+    Serial.print(" | Lat: ");
+    printOrNA(Serial, gps.location.isValid(), gps.location.lat(), 6);
+    Serial.print(" | Lon: ");
+    printOrNA(Serial, gps.location.isValid(), gps.location.lng(), 6);
+    Serial.print(" | Alt(m): ");
+    printOrNA(Serial, gps.altitude.isValid(), gps.altitude.meters(), 2);
+    Serial.print(" | Sats: ");
+    if (gps.satellites.isValid()) {
+        Serial.print(gps.satellites.value());
+    } else {
+        Serial.print("NA");
+    }
+    Serial.print(" | HDOP: ");
+    if (gps.hdop.isValid()) {
+        Serial.print(gps.hdop.hdop(), 2);
+    } else {
+        Serial.print("NA");
+    }
+    Serial.println();
+}
+
+void logMeasurement(double freqHz) {
     if (!sdReady) {
         return;
     }
 
-    File file = SD.open(LOG_FILENAME, FILE_WRITE);
-    if (!file) {
-        Serial.println("ERROR: unable to append to CSV log file");
+    File f = SD.open(currentLogFileName, FILE_WRITE);
+    if (!f) {
+        Serial.println("ERROR: failed to open log file");
         return;
     }
 
-    file.print(millis());
-    file.print(',');
+    f.print(millis());
+    f.print(',');
+    f.print(freqHz, 2);
+    f.print(',');
 
-    if (gps.date.isValid() && gps.time.isValid()) {
-        char ts[25];
-        snprintf(ts, sizeof(ts), "%04d-%02d-%02dT%02d:%02d:%02dZ",
-                 gps.date.year(), gps.date.month(), gps.date.day(),
-                 gps.time.hour(), gps.time.minute(), gps.time.second());
-        file.print(ts);
-    }
-    file.print(',');
-
-    if (freq < 0.0) {
-        file.print("timeout");
+    if (gps.date.isValid()) {
+        printFourDigits(f, gps.date.year());
+        f.print('-');
+        printTwoDigits(f, gps.date.month());
+        f.print('-');
+        printTwoDigits(f, gps.date.day());
     } else {
-        file.print("ok");
+        f.print("NA");
     }
-    file.print(',');
+    f.print(',');
 
-    if (freq < 0.0) {
-        file.print("NA");
+    if (gps.time.isValid()) {
+        printTwoDigits(f, gps.time.hour());
+        f.print(':');
+        printTwoDigits(f, gps.time.minute());
+        f.print(':');
+        printTwoDigits(f, gps.time.second());
+        f.print('.');
+        printTwoDigits(f, gps.time.centisecond());
     } else {
-        file.print(freq, 2);
+        f.print("NA");
     }
-    file.print(',');
+    f.print(',');
 
-    if (gps.location.isValid()) {
-        file.print(gps.location.lat(), 6);
-    } else {
-        file.print("NA");
-    }
-    file.print(',');
-
-    if (gps.location.isValid()) {
-        file.print(gps.location.lng(), 6);
-    } else {
-        file.print("NA");
-    }
-    file.print(',');
-
-    if (gps.altitude.isValid()) {
-        file.print(gps.altitude.meters(), 1);
-    } else {
-        file.print("NA");
-    }
-    file.print(',');
+    printOrNA(f, gps.location.isValid(), gps.location.lat(), 6);
+    f.print(',');
+    printOrNA(f, gps.location.isValid(), gps.location.lng(), 6);
+    f.print(',');
+    printOrNA(f, gps.altitude.isValid(), gps.altitude.meters(), 2);
+    f.print(',');
 
     if (gps.satellites.isValid()) {
-        file.print(gps.satellites.value());
+        f.print(gps.satellites.value());
     } else {
-        file.print("NA");
+        f.print("NA");
     }
+    f.print(',');
 
-    file.println();
-    file.close();
+    if (gps.hdop.isValid()) {
+        f.print(gps.hdop.hdop(), 2);
+    } else {
+        f.print("NA");
+    }
+    f.println();
+    f.close();
 }
 
 // ────────────────────────────────────────────────────────────────────
@@ -152,7 +241,7 @@ double measure() {
     // ── 2. Wait for done ────────────────────────────────────────────
     unsigned long t0 = millis();
     while (digitalRead(PIN_DONE) == LOW) {
-        pollGNSS();
+        updateGPS();
         if (millis() - t0 > MEASURE_TIMEOUT_MS) {
             // Timed out waiting for measurement
             digitalWrite(PIN_CNT_ENABLE, LOW);
@@ -175,7 +264,7 @@ double measure() {
 
     t0 = millis();
     while (bitsRead < TX_BITS) {
-        pollGNSS();
+        updateGPS();
         if (millis() - t0 > TX_TIMEOUT_MS) {
             // Timed out during serial readout
             return -1.0;
@@ -207,12 +296,7 @@ double measure() {
 // ────────────────────────────────────────────────────────────────────
 void setup() {
     Serial.begin(115200);
-    GNSS_SERIAL.begin(GNSS_BAUD_RATE);
-
-    sdReady = SD.begin(BUILTIN_SDCARD);
-    if (sdReady) {
-        writeCsvHeaderIfNeeded();
-    }
+    Serial1.begin(GPS_BAUD_RATE);
 
     pinMode(PIN_CNT_ENABLE,     OUTPUT);
     pinMode(PIN_START_TRANSMIT, OUTPUT);
@@ -229,53 +313,36 @@ void setup() {
     // Reset the FPGA FSM
     resetFPGA();
 
-    Serial.println("FrequencyDetector ready.");
-    Serial.println("GNSS logging enabled.");
-    if (sdReady) {
-        Serial.print("CSV logging to SD file: ");
-        Serial.println(LOG_FILENAME);
+    sdReady = SD.begin(SD_CS_PIN);
+    if (!sdReady) {
+        Serial.println("WARNING: SD init failed; logging disabled");
     } else {
-        Serial.println("WARNING: SD init failed, CSV logging disabled.");
+        if (!createSessionLogFile()) {
+            sdReady = false;
+        }
     }
+
+    Serial.println("FrequencyDetector ready.");
 }
 
 // ────────────────────────────────────────────────────────────────────
 //  loop()
 // ────────────────────────────────────────────────────────────────────
 void loop() {
-    pollGNSS();
-
+    updateGPS();
     double freq = measure();
-    writeCsvRow(freq);
 
     if (freq < 0.0) {
-        Serial.print("ERROR: measurement timed out");
+        Serial.println("ERROR: measurement timed out");
+        printGpsDebugLine();
         resetFPGA();  // reset FPGA FSM to recover from error state
     } else {
-        Serial.print("Frequency_Hz=");
+        Serial.print("Frequency: ");
         Serial.print(freq, 2);
+        Serial.print(" Hz | ");
+        printGpsDebugLine();
+        logMeasurement(freq);
     }
-
-    if (gps.location.isValid()) {
-        Serial.print(", Lat=");
-        Serial.print(gps.location.lat(), 6);
-        Serial.print(", Lon=");
-        Serial.print(gps.location.lng(), 6);
-    } else {
-        Serial.print(", Lat=NA, Lon=NA");
-    }
-
-    if (gps.altitude.isValid()) {
-        Serial.print(", Alt_m=");
-        Serial.print(gps.altitude.meters(), 1);
-    }
-
-    if (gps.satellites.isValid()) {
-        Serial.print(", Sats=");
-        Serial.print(gps.satellites.value());
-    }
-
-    Serial.println();
 
     delay(1000);  // wait 1 s between measurements
 }
