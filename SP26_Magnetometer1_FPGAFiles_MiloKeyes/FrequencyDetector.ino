@@ -250,6 +250,7 @@ void loop() {
 
     if (freq < 0.0) {
         Serial.print("ERROR: measurement timed out");
+        resetFPGA();  // reset FPGA FSM to recover from error state
     } else {
         Serial.print("Frequency_Hz=");
         Serial.print(freq, 2);
